@@ -9,7 +9,7 @@ Snow falls on your desktop and piles up on your windows and Dock. Roll it into s
 ## What it can do ✨
 
 - 🌨️ **Cozy snowfall**: three layers of flakes (near, middle and far) drifting in a gentle wind
-- 🪟 **Snow settles on your open windows** It follows the rounded corners, holds a natural slope, spills off the ends when it gets deep, rides the window when you move it, and slides off when you jerk or minimize it.
+- 🪟 **Snow settles on your open windows** It follows the rounded corners, holds a natural slope, spills off the ends when the window is resized, rides the window when you move it, and slides off when you jerk or minimize it.
 - 🖱️ **Sweep the cursor through the falling snow** and it swirls out of the way, then drifts back into place
 - 🏔️ **Snow piles up** along the Dock and at the bottom of the screen
 - 🪟 **Drag a window and *whoosh*!** The snow flies off. The faster you drag, the farther it goes
