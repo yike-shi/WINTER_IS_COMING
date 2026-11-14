@@ -9,7 +9,9 @@ Snow falls on your desktop and piles up on your windows and Dock. Roll it into s
 ## What it can do ✨
 
 - 🌨️ **Cozy snowfall**: three layers of flakes (near, middle and far) drifting in a gentle wind
-- 🏔️ **Snow piles up** on top of your windows, along the Dock and at the bottom of the screen
+- 🪟 **Snow settles on your open windows** It follows the rounded corners, holds a natural slope, spills off the ends when the window is resized, rides the window when you move it, and slides off when you jerk or minimize it.
+- 🖱️ **Sweep the cursor through the falling snow** and it swirls out of the way, then drifts back into place
+- 🏔️ **Snow piles up** along the Dock and at the bottom of the screen
 - 🪟 **Drag a window and *whoosh*!** The snow flies off. The faster you drag, the farther it goes
 - ⚪ **Roll snowballs** just by moving your mouse sideways over the snow (no clicking!). They grow as they roll
 - 🎳 **Snowballs push each other** along, and one that's pushed off the edge falls down
@@ -20,7 +22,7 @@ Snow falls on your desktop and piles up on your windows and Dock. Roll it into s
 ## Try it 🚀
 
 ```sh
-git clone https://github.com/<your-username>/WINTER_IS_COMING.git
+git clone https://github.com/yike-shi/WINTER_IS_COMING.git
 cd WINTER_IS_COMING
 zsh build.sh
 ```
