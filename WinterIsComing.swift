@@ -1,7 +1,9 @@
 // WinterIsComing — snow on your Mac desktop.
-// Snow piles up on top of windows, the Dock and the bottom of the screen and flies off when you drag a
-// window. Hover over the snow to roll snowballs, push them into each other, drag them with the mouse and
-// stack three of them into a snowman. See README.md for the full list.
+// Snow falls in front of your open windows and settles along their top edges the way Snowhush does: it clings
+// around the rounded corners, holds a natural slope, spills off the ends when it gets deep, rides the window as
+// you move it, slides when you jerk it and drops away when you minimize it. Sweep the cursor through the falling
+// snow and it swirls out of the way. Hover over the snow to roll snowballs, push them into each other, drag them
+// with the mouse and stack three of them into a snowman. See README.md for the full list.
 // Build: swiftc -O WinterIsComing.swift -o WinterIsComing
 // Run:   ./WinterIsComing   (a ❄︎ icon appears in the menu bar: pause / snow amount / quit)
 
@@ -22,12 +24,32 @@ enum Cfg {
     static let dockPad: CGFloat = 4          // extra width of the Dock pile on each side of the icon area
     static let dockTopOffset: CGFloat = -1   // lower it if the snow floats above the Dock, raise it if it sinks in
     static let fallSpeed: CGFloat = 1.5      // falling speed multiplier (1 = original, bigger = faster)
-    static let flakesInFront = true          // some of the smallest flakes fall in front of windows, so they can reach the Dock
+    static let snowOverWindows = true        // snow falls in front of windows, so you see it land on their top edges
+    static let flakesInFront = true          // when snowOverWindows is off: some of the smallest flakes still fall in front
     static let inFrontFraction: CGFloat = 0.4 // share of the smallest layer that falls in front (0...1)
+    static let cursorWakeRadius: CGFloat = 80     // how far a moving cursor stirs the falling snow (px)
+    static let cursorWakeMinSpeed: CGFloat = 20   // a cursor slower than this leaves the air still
+    static let cursorWakeMaxSpeed: CGFloat = 500  // cap on the air's speed, so a flick doesn't fling flakes away
     static let ballStartRadius: CGFloat = 3  // a new snowball starts this small
     static let ballMaxRadius: CGFloat = 28   // and stops growing at this size
     static let maxBalls = 20                 // oldest resting snowballs are removed beyond this
     static let dockGain: CGFloat = 3.0       // snow landing on the Dock counts this many times more, so it builds up
+
+    // Window snow, ported from Snowhush's SnowLayer / carry model
+    static let windowDepth: CGFloat = 14         // how deep snow grows on a window before more slides off
+    static let windowRepose: CGFloat = 0.8       // steepest slope the snow holds, as rise over run
+    static let windowRounding: CGFloat = 0.15    // how quickly crests and notches round out
+    static let windowCling: CGFloat = 1.4        // snow clings down a rounded corner up to this slope
+    static let windowCornerRadius: CGFloat = 18  // macOS window corner radius the bed follows
+    static let windowCornerExponent: CGFloat = 2.5
+    static let snowGravity: CGFloat = 2500       // gravity felt by the snow riding a window
+    static let snowAdhesion: CGFloat = 3500      // how hard the snow sticks to the window
+    static let snowGrip: CGFloat = 3.0           // static friction: how hard the window must be jerked to make it slide
+    static let snowSlip: CGFloat = 2.0           // sliding friction once it lets go
+    static let snowBreakLift: CGFloat = 10       // how far it lifts before the whole heap lets go
+    static let snowShaking: CGFloat = 4.0        // vibration that shakes grains off the heap
+    static let trackTime: CGFloat = 0.06         // how closely the snow follows its window
+    static let jumpSpeed: CGFloat = 6000         // faster than this, the window jumped out from under its snow
 }
 
 // MARK: - Find the Dock (needs Accessibility permission)
@@ -207,6 +229,7 @@ let layers: [Layer] = [
         pile = nil
         below = nil
         vel = v
+        node.isHidden = false    // it may have been hidden behind a window (or on a surface that vanished)
     }
 }
 
@@ -222,6 +245,7 @@ let layers: [Layer] = [
     var windFactor: CGFloat = 1
     var inFront = false          // true = falls in front of windows (ignores them), lands on Dock / ground
     var isClump = false          // true = clump sliding off a surface (affected by gravity)
+    var push = CGVector.zero     // air dragged along by the cursor; decays after the cursor passes
     var ignoreID = -1            // don't land right back on the surface it came from
     var ignoreUntil: CGFloat = 0
 
@@ -233,7 +257,7 @@ let layers: [Layer] = [
 @MainActor final class Pile {
     var minX: CGFloat
     var topY: CGFloat
-    let width: CGFloat
+    var width: CGFloat
     let maxH: CGFloat
     var h: [CGFloat]
     var caps: [CGFloat]          // max height per column, tapering at both ends so it looks rounded
@@ -242,11 +266,35 @@ let layers: [Layer] = [
     let shade = SKShapeNode()
     var dirty = false
 
-    init(minX: CGFloat, topY: CGFloat, width: CGFloat, maxH: CGFloat, parent: SKNode) {
+    // MARK: Window ledge (Snowhush's SnowLayer, on a smaller scale)
+    /// A window's snow is a layer that clings to its top edge: the bed dips around the window's rounded corners,
+    /// capacity is how deep it grows, and the window moving carries the layer, which slides or flies off.
+    let isWindow: Bool
+    var bed: [CGFloat] = []          // underside of the snow, relative to the window's top edge
+    var capacity: [CGFloat] = []     // depth at which fresh snow stops building up
+    var right: CGFloat = 0           // the window's right edge, to tell a resize from a move
+    var track = CGPoint.zero         // smoothed path of the window, whose acceleration the snow feels
+    var trackVel = CGVector.zero
+    var jolt = CGVector.zero
+    var offset = CGVector.zero       // how far the snow has slid along or lifted off its window
+    var offsetVel = CGVector.zero
+    var agitation: CGFloat = 0
+    var movedAt: CGFloat = -10
+    var swingDir = CGVector.zero
+    var swingPeak: CGFloat = 0
+    var prevSwingPeak: CGFloat = 0
+    var parity = false
+    var spillL: CGFloat = 0
+    var spillR: CGFloat = 0
+    /// Snow that came off this ledge, for the scene to turn into falling clumps.
+    var pending: [(height: CGFloat, at: CGPoint, vel: CGVector)] = []
+
+    init(minX: CGFloat, topY: CGFloat, width: CGFloat, maxH: CGFloat, parent: SKNode, isWindow: Bool = false) {
         self.minX = minX
         self.topY = topY
         self.width = width
         self.maxH = maxH
+        self.isWindow = isWindow
         let n = max(1, Int((width / Cfg.colW).rounded(.up)))
         h = Array(repeating: 0, count: n)
         occ = Array(repeating: false, count: n)
@@ -254,6 +302,12 @@ let layers: [Layer] = [
             let edgeDist = min(CGFloat(i) + 0.5, CGFloat(n - i) - 0.5) * Cfg.colW
             let t = min(1, edgeDist / (maxH * 2.2))
             return maxH * t.squareRoot()
+        }
+        if isWindow {
+            right = minX + width
+            track = CGPoint(x: minX, y: topY)
+            updateShape()
+            caps = capacity
         }
         body.fillColor = NSColor(calibratedWhite: 1, alpha: 0.97)
         body.strokeColor = .clear
@@ -271,26 +325,67 @@ let layers: [Layer] = [
 
     var count: Int { h.count }
     var total: CGFloat { h.reduce(0, +) }
+    var baseX: CGFloat { minX + offset.dx }
+    var baseY: CGFloat { topY + offset.dy }
 
     func col(at x: CGFloat) -> Int? {
-        let c = Int((x - minX) / Cfg.colW)
+        let c = Int((x - baseX) / Cfg.colW)
         return (c >= 0 && c < count) ? c : nil
     }
-    func colX(_ c: Int) -> CGFloat { minX + (CGFloat(c) + 0.5) * Cfg.colW }
-    func surface(_ c: Int) -> CGFloat { topY + h[c] }
+    func colX(_ c: Int) -> CGFloat { baseX + (CGFloat(c) + 0.5) * Cfg.colW }
+    /// The underside of the snow at a column: the window's top edge, dipping down around its rounded corners.
+    func floor(_ c: Int) -> CGFloat { baseY + (isWindow ? bed[c] : 0) }
+    func surface(_ c: Int) -> CGFloat { floor(c) + h[c] }
+
+    /// Snowhush's window ledge: capacity and a bed that follows the window's rounded corners.
+    func updateShape() {
+        let n = count
+        let radius = Cfg.windowCornerRadius
+        bed = (0..<n).map { i in
+            guard radius > 0 else { return 0 }
+            let x = (CGFloat(i) + 0.5) * Cfg.colW
+            let inset = min(x, width - x)
+            if inset >= radius { return 0 }
+            let u = Double(1 - inset / radius)
+            let e = Double(Cfg.windowCornerExponent)
+            let curve = 1 - pow(1 - pow(u, e), 1 / e)
+            return -radius * CGFloat(max(0, curve))
+        }
+        let p0 = rnd(0, 6.28), p1 = rnd(0, 6.28)
+        capacity = (0..<n).map { i in
+            let x = CGFloat(i) * Cfg.colW
+            let drift = 0.12 * sin(x * 0.0105 + p0) + 0.07 * sin(x * 0.037 + p1)
+            return Cfg.windowDepth * (0.95 + drift)
+        }
+    }
 
     func add(at c: Int, amount: CGFloat) {
-        let spread: [(Int, CGFloat)] = [(0, 1), (-1, 0.75), (1, 0.75), (-2, 0.45), (2, 0.45), (-3, 0.2), (3, 0.2)]
-        for (o, w) in spread {
-            let i = c + o
-            guard i >= 0, i < count, !occ[i] else { continue }
-            h[i] = min(caps[i], h[i] + amount * w)
+        if isWindow {
+            // Snowhush's deposit: a narrow bell of snow centred on the flake, filling less as a column nears capacity.
+            let kernel: [(Int, CGFloat)] = [(-2, 0.0625), (-1, 0.25), (0, 0.375), (1, 0.25), (2, 0.0625)]
+            for (o, w) in kernel {
+                let i = c + o
+                guard i >= 0, i < count, !occ[i], capacity[i] > 0 else { continue }
+                let fill = max(0, 1 - h[i] / capacity[i])
+                h[i] += amount * w * fill
+            }
+        } else {
+            let spread: [(Int, CGFloat)] = [(0, 1), (-1, 0.75), (1, 0.75), (-2, 0.45), (2, 0.45), (-3, 0.2), (3, 0.2)]
+            for (o, w) in spread {
+                let i = c + o
+                guard i >= 0, i < count, !occ[i] else { continue }
+                h[i] = min(caps[i], h[i] + amount * w)
+            }
         }
         dirty = true
     }
 
     // let snow slump sideways where the slope is too steep
     func relax() -> Bool {
+        isWindow ? relaxWindow() : relaxSimple()
+    }
+
+    func relaxSimple() -> Bool {
         guard count > 1 else { return false }
         var moved = false
         for i in 0..<(count - 1) where !occ[i] && !occ[i + 1] {
@@ -305,9 +400,97 @@ let layers: [Layer] = [
         return moved
     }
 
+    /// Snowhush's relax: slopes steeper than the angle of repose slump, rounded crests even out, snow clings as
+    /// far down a rounded corner as `windowCling` allows, and whatever slides past an end spills off it.
+    func relaxWindow() -> Bool {
+        let n = count
+        guard n > 1 else { return false }
+        let limit = Cfg.windowRepose * Cfg.colW
+        let steepest = Cfg.windowCling * Cfg.colW
+        let forwardFirst = parity
+        parity = !parity
+        var moved = false
+        var spilledL: CGFloat = 0
+        var spilledR: CGFloat = 0
+        let rounding = Cfg.windowRounding
+
+        for pass in 0..<6 {
+            var shifted = false
+            let forward = (pass % 2 == 0) == forwardFirst
+            for k in 0..<(n - 1) {
+                let i = forward ? k : n - 2 - k
+                if occ[i] || occ[i + 1] { continue }
+                let difference = (bed[i] + h[i]) - (bed[i + 1] + h[i + 1])
+                let fall = bed[i] - bed[i + 1]
+                let ahead = limit + min(max(fall, 0), steepest)
+                let behind = limit + min(max(-fall, 0), steepest)
+                if difference > ahead + 0.01 {
+                    let transfer = min((difference - ahead) * 0.5, h[i])
+                    h[i] -= transfer
+                    h[i + 1] += transfer
+                    if transfer > 0.001 { moved = true; shifted = true }
+                } else if difference < -behind - 0.01 {
+                    let transfer = min((-difference - behind) * 0.5, h[i + 1])
+                    h[i + 1] -= transfer
+                    h[i] += transfer
+                    if transfer > 0.001 { moved = true; shifted = true }
+                }
+            }
+            if !occ[0] && h[0] > limit + 0.01 {
+                let transfer = (h[0] - limit) * 0.5
+                h[0] -= transfer
+                spilledL += transfer
+                moved = true
+                shifted = true
+            }
+            if !occ[n - 1] && h[n - 1] > limit + 0.01 {
+                let transfer = (h[n - 1] - limit) * 0.5
+                h[n - 1] -= transfer
+                spilledR += transfer
+                moved = true
+                shifted = true
+            }
+            if !shifted { break }
+        }
+        // Round crests and notches toward their neighbours' average, leaving even slopes alone.
+        if n > 3 {
+            for i in 1..<(n - 2) {
+                if occ[i - 1] || occ[i] || occ[i + 1] || occ[i + 2] { continue }
+                let s0 = bed[i - 1] + h[i - 1]
+                let s1 = bed[i] + h[i]
+                let s2 = bed[i + 1] + h[i + 1]
+                let s3 = bed[i + 2] + h[i + 2]
+                let kink = (s1 - s2) - 0.5 * ((s0 - s1) + (s2 - s3))
+                if abs(kink) <= 0.02 { continue }
+                let transfer = kink > 0 ? min(kink * rounding, h[i]) : max(kink * rounding, -h[i + 1])
+                if transfer > 0 {
+                    h[i] -= transfer
+                    h[i + 1] += transfer
+                } else {
+                    h[i + 1] += transfer
+                    h[i] -= transfer
+                }
+                if abs(transfer) > 0.003 { moved = true }
+            }
+        }
+        spillL += spilledL * Cfg.colW
+        spillR += spilledR * Cfg.colW
+        return moved
+    }
+
     func clear() {
         for i in 0..<count { h[i] = 0 }
+        spillL = 0
+        spillR = 0
+        pending.removeAll()
         dirty = true
+    }
+
+    /// The snow's drawn surface, smoothed across its neighbours the way Snowhush's shader smooths its height field.
+    func smoothedSurface(_ c: Int) -> CGFloat {
+        let l = max(0, c - 1), r = min(count - 1, c + 1)
+        let smoothed = 0.25 * h[l] + 0.5 * h[c] + 0.25 * h[r]
+        return floor(c) + smoothed
     }
 
     func redraw() {
@@ -319,12 +502,214 @@ let layers: [Layer] = [
             return
         }
         let p = CGMutablePath()
-        p.move(to: CGPoint(x: minX, y: topY))
-        for c in 0..<count { p.addLine(to: CGPoint(x: colX(c), y: topY + h[c])) }
-        p.addLine(to: CGPoint(x: minX + width, y: topY))
+        if isWindow {
+            // The snow is the band between its bed (which dips around the window's corners) and its surface.
+            p.move(to: CGPoint(x: baseX, y: floor(0)))
+            for c in 0..<count { p.addLine(to: CGPoint(x: colX(c), y: floor(c))) }
+            p.addLine(to: CGPoint(x: baseX + width, y: floor(count - 1)))
+            p.addLine(to: CGPoint(x: baseX + width, y: max(floor(count - 1), smoothedSurface(count - 1))))
+            for c in stride(from: count - 1, through: 0, by: -1) {
+                p.addLine(to: CGPoint(x: colX(c), y: smoothedSurface(c)))
+            }
+            p.addLine(to: CGPoint(x: baseX, y: max(floor(0), smoothedSurface(0))))
+        } else {
+            p.move(to: CGPoint(x: minX, y: topY))
+            for c in 0..<count { p.addLine(to: CGPoint(x: colX(c), y: topY + h[c])) }
+            p.addLine(to: CGPoint(x: minX + width, y: topY))
+        }
         p.closeSubpath()
         body.path = p
         shade.path = p
+    }
+
+    // MARK: Window motion (ported from Snowhush's move_ledge / carry)
+
+    /// The window moved or was resized: the snow rides it, feels the jolt, and slides or flies off when it can't
+    /// keep up. `now` is the scene clock.
+    func moveWindow(left: CGFloat, right newRight: CGFloat, top: CGFloat, dt: CGFloat, now: CGFloat) {
+        guard isWindow else { return }
+        let oldLeft = minX, oldTop = topY
+        let oldRight = self.right > 0 ? self.right : oldLeft + width
+        let shift = abs(left - oldLeft) <= abs(newRight - oldRight) ? left - oldLeft : newRight - oldRight
+        let displacement = CGVector(dx: shift, dy: top - oldTop)
+        let newWidth = max(Cfg.colW, newRight - left)
+        let columns = max(1, Int((newWidth / Cfg.colW).rounded(.up)))
+        let resized = columns != count || abs(left - oldLeft - shift) > 0.5 || abs(newWidth - width) > 0.01
+        if displacement.dx == 0 && displacement.dy == 0 && !resized {
+            self.right = newRight
+            return
+        }
+        let elapsed = max(dt, 1.0 / 120)
+        let wasResting = now - movedAt > 0.3 && dt > 0.05
+        movedAt = now
+        let jump = (displacement.dx * displacement.dx + displacement.dy * displacement.dy).squareRoot() / elapsed
+        let jumped = jump > Cfg.jumpSpeed
+        if jumped {
+            // The window vanished from under the snow and reappeared elsewhere: nothing carried it along.
+            pending.append((height: -1, at: .zero, vel: .zero))
+            offset = .zero
+            offsetVel = .zero
+            trackVel = .zero
+        }
+        if resized {
+            let by = Int(((oldLeft + shift - left) / Cfg.colW).rounded())
+            width = newWidth
+            resizeColumns(to: columns, by: by)
+        }
+        minX = left
+        topY = top
+        track.x += left - oldLeft - shift      // a resize doesn't move the window under its snow
+        if jumped {
+            track = CGPoint(x: left, y: top)
+        } else if wasResting {
+            // Join the motion at its current pace, with the lag a steady follow would have, instead of as a jolt.
+            trackVel = CGVector(dx: displacement.dx / elapsed, dy: displacement.dy / elapsed)
+            track = CGPoint(x: left - trackVel.dx * Cfg.trackTime, y: top - trackVel.dy * Cfg.trackTime)
+        }
+        self.right = newRight
+        dirty = true
+    }
+
+    func resizeColumns(to newCount: Int, by: Int) {
+        if newCount != count || by != 0 {
+            var fresh = [CGFloat](repeating: 0, count: newCount)
+            for i in 0..<count {
+                let j = i + by
+                if j >= 0 && j < newCount {
+                    fresh[j] += h[i]
+                } else if h[i] > 0.05 {
+                    pending.append((height: h[i], at: CGPoint(x: colX(i), y: floor(i)), vel: trackVel))
+                }
+            }
+            h = fresh
+            occ = Array(repeating: false, count: newCount)
+        }
+        updateShape()
+        caps = capacity
+        dirty = true
+    }
+
+    /// Carries the snow as a body riding the window: gravity plus the window's inertia, friction holding it, and
+    /// it flying free when the window drops away faster than gravity or stops short after rising.
+    func carry(dt: CGFloat, joltScale: CGFloat) {
+        guard isWindow, dt > 0, dt < 0.5 else { return }
+        let previousVelocity = trackVel
+        smoothDamp(&track, &trackVel, CGPoint(x: minX, y: topY), Cfg.trackTime, dt)
+        var acceleration = CGVector(dx: (trackVel.dx - previousVelocity.dx) / dt,
+                                    dy: (trackVel.dy - previousVelocity.dy) / dt)
+        jolt = acceleration
+        acceleration.dy *= joltScale
+
+        // Agitation is vibration: two consecutive back-and-forth swings, not a single start or stop.
+        agitation *= CGFloat(exp(Double(-dt / 0.3)))
+        let magnitude = (acceleration.dx * acceleration.dx + acceleration.dy * acceleration.dy).squareRoot()
+        if magnitude > 1 && (acceleration.dx * swingDir.dx + acceleration.dy * swingDir.dy) < 0 {
+            agitation = max(agitation, min(prevSwingPeak, swingPeak) / Cfg.snowGravity)
+            prevSwingPeak = swingPeak
+            swingPeak = magnitude
+            swingDir = CGVector(dx: acceleration.dx / magnitude, dy: acceleration.dy / magnitude)
+        } else {
+            swingPeak = max(swingPeak, magnitude)
+            if magnitude > 1 && swingDir.dx == 0 && swingDir.dy == 0 {
+                swingDir = CGVector(dx: acceleration.dx / magnitude, dy: acceleration.dy / magnitude)
+            }
+        }
+
+        if total <= 0.05 {
+            offset = .zero
+            offsetVel = .zero
+            return
+        }
+
+        var lift = offset.dy
+        var liftVelocity = offsetVel.dy
+        let fall = -Cfg.snowGravity - acceleration.dy
+        if lift > 0 || fall > Cfg.snowAdhesion {
+            liftVelocity += fall * dt
+            lift += liftVelocity * dt
+            if lift <= 0 {
+                lift = 0
+                liftVelocity = 0
+            }
+        }
+
+        let pressure = lift > 0 ? 0 : max(0, Cfg.snowGravity + Cfg.snowAdhesion + acceleration.dy)
+        let drive = -acceleration.dx
+        var slideVelocity = offsetVel.dx
+        if !(slideVelocity == 0 && abs(drive) <= Cfg.snowGrip * pressure) {
+            let direction: CGFloat = slideVelocity != 0 ? (slideVelocity > 0 ? 1 : -1) : (drive > 0 ? 1 : -1)
+            let next = slideVelocity + (drive - direction * Cfg.snowSlip * pressure) * dt
+            slideVelocity = (pressure > 0 && next * direction <= 0) ? 0 : next
+        }
+
+        var slide = offset.dx + slideVelocity * dt
+        let carried = CGVector(dx: trackVel.dx + slideVelocity, dy: trackVel.dy + liftVelocity)
+        while abs(slide) >= Cfg.colW {
+            let direction: CGFloat = slide > 0 ? 1 : -1
+            let (dropped, at) = slideColumn(direction > 0 ? 1 : -1)
+            slide -= direction * Cfg.colW
+            if dropped > 0.01 {
+                pending.append((height: dropped, at: at, vel: carried))
+            }
+        }
+
+        offset = CGVector(dx: slide, dy: lift)
+        offsetVel = CGVector(dx: slideVelocity, dy: liftVelocity)
+        if lift != 0 || slide != 0 { dirty = true }
+
+        if lift > Cfg.snowBreakLift {
+            pending.append((height: -1, at: .zero, vel: carried))
+            offset = .zero
+            offsetVel = .zero
+        } else if agitation > Cfg.snowShaking {
+            // A granular bed shaken well past gravity throws grains off its surface.
+            let rate = min(0.8, 0.06 * (agitation - Cfg.snowShaking))
+            let picks = Int(CGFloat(count) * rate * dt * 2 + CGFloat.random(in: 0...1))
+            for _ in 0..<picks {
+                let c = Int.random(in: 0..<count)
+                let amount = h[c] * 0.35
+                guard amount > 0.05 else { continue }
+                h[c] -= amount
+                pending.append((height: amount, at: CGPoint(x: colX(c), y: surface(c)), vel: carried))
+                dirty = true
+            }
+        }
+    }
+
+    /// Shifts the height map one column and returns what slid off the far end.
+    func slideColumn(_ direction: Int) -> (CGFloat, CGPoint) {
+        guard count > 1 else { return (0, .zero) }
+        if direction > 0 {
+            let last = count - 1
+            let dropped = h[last]
+            let at = CGPoint(x: colX(last) + Cfg.colW, y: floor(last))
+            h.removeLast()
+            h.insert(0, at: 0)
+            occ.removeLast()
+            occ.insert(false, at: 0)
+            return (dropped, at)
+        }
+        let dropped = h[0]
+        let at = CGPoint(x: colX(0) - Cfg.colW, y: floor(0))
+        h.removeFirst()
+        h.append(0)
+        occ.removeFirst()
+        occ.append(false)
+        return (dropped, at)
+    }
+
+    /// Critically damped follow (Snowhush's smooth_damp), stable at any time step.
+    func smoothDamp(_ current: inout CGPoint, _ velocity: inout CGVector, _ target: CGPoint, _ time: CGFloat, _ dt: CGFloat) {
+        let omega = 2 / max(time, 0.001)
+        let x = omega * dt
+        let decay = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+        let change = CGVector(dx: current.x - target.x, dy: current.y - target.y)
+        let temp = CGVector(dx: (velocity.dx + change.dx * omega) * dt,
+                            dy: (velocity.dy + change.dy * omega) * dt)
+        velocity.dx = (velocity.dx - temp.dx * omega) * decay
+        velocity.dy = (velocity.dy - temp.dy * omega) * decay
+        current.x = target.x + (change.dx + temp.dx) * decay
+        current.y = target.y + (change.dy + temp.dy) * decay
     }
 
     func remove() {
@@ -356,6 +741,9 @@ final class SnowScene: SKScene {
     var balls: [Snowball] = []
     weak var activeBall: Snowball?
     var lastMouse = NSEvent.mouseLocation
+    var cursorPos = NSEvent.mouseLocation   // where the cursor is now, in scene coordinates
+    var cursorVel = CGVector.zero           // how fast it moves; its wake stirs the falling snow
+    var cursorSeen = false
     var ballTex: SKTexture?
     var dragBall: Snowball?
     var dragTarget = CGPoint.zero
@@ -420,6 +808,7 @@ final class SnowScene: SKScene {
         f.inFront = Cfg.flakesInFront && li == 0 && CGFloat.random(in: 0...1) < Cfg.inFrontFraction
         f.isClump = false
         f.ignoreID = -1
+        f.push = .zero
         f.size = CGFloat.random(in: L.size)
         f.vel = CGVector(dx: 0, dy: -CGFloat.random(in: L.speed) * Cfg.fallSpeed)
         f.swayAmp = CGFloat.random(in: L.sway)
@@ -436,6 +825,7 @@ final class SnowScene: SKScene {
         let f = obtain()
         f.isClump = true
         f.inFront = false
+        f.push = .zero
         f.size = rnd(2.5, 5)
         f.vel = vel
         f.ignoreID = sourceID
@@ -462,7 +852,7 @@ final class SnowScene: SKScene {
             var amount = p.h[c] / 3.5 * k
             while amount > 0 {
                 if amount < 1 && CGFloat.random(in: 0...1) > amount { break }
-                spawnClump(at: CGPoint(x: p.colX(c) + rnd(-1.5, 1.5), y: p.topY + rnd(0, p.h[c])),
+                spawnClump(at: CGPoint(x: p.colX(c) + rnd(-1.5, 1.5), y: p.floor(c) + rnd(0, p.h[c])),
                            vel: CGVector(dx: fling.dx + rnd(-40, 40), dy: fling.dy + rnd(10, 80)),
                            sourceID: id)
                 amount -= 1
@@ -483,6 +873,7 @@ final class SnowScene: SKScene {
             pollWindows(dt: pollAcc)
             pollAcc = 0
         }
+        trackCursor(dt)
         stepFlakes(dt)
         updateMouseCapture()
         if let b = dragBall { stepDrag(b, dt) } else { updateRolling() }
@@ -678,7 +1069,7 @@ final class SnowScene: SKScene {
     /// Is the mouse inside the snow band of this pile (a bit below the edge up to a bit above the snow)?
     func mouseOver(_ p: Pile, _ m: CGPoint) -> Bool {
         guard let c = p.col(at: m.x), !p.occ[c] else { return false }
-        return m.y >= p.topY - 6 && m.y <= p.topY + p.h[c] + 14
+        return m.y >= p.floor(c) - 6 && m.y <= p.surface(c) + 14
     }
 
     /// Which snow surface is the mouse hovering over? Dock first, then windows front to back, then the ground.
@@ -686,8 +1077,8 @@ final class SnowScene: SKScene {
         // Hovering over a snowball counts as hovering over the snow it sits on. Without this, a big ball
         // stops rolling as soon as the cursor rises above the thin snow band, which makes pushing jerky.
         for b in balls where !b.falling && !b.dragging && !b.node.isHidden && b.below == nil {
-            guard let p = b.pile, abs(m.x - b.x) < b.r + 8 else { continue }
-            if m.y >= p.topY - 6 && m.y <= p.topY + 2 * b.r + 8 { return p }
+            guard let p = b.pile, let c = p.col(at: m.x), abs(m.x - b.x) < b.r + 8 else { continue }
+            if m.y >= p.floor(c) - 6 && m.y <= p.surface(c) + 2 * b.r + 8 { return p }
         }
         if let d = dockPile, mouseOver(d, m) { return d }
         if let dr = dockRect, dr.contains(m) { return nil }
@@ -716,7 +1107,7 @@ final class SnowScene: SKScene {
             let b = Snowball(body: ballTex!, specks: speckTex!)
             b.x = m.x
             b.pile = p
-            b.y = p.topY + b.r - 1.5
+            b.y = p.surface(c) + b.r - 1.5
             b.layout()
             world.addChild(b.node)
             balls.append(b)
@@ -729,7 +1120,7 @@ final class SnowScene: SKScene {
         guard let b = activeBall else { return }
 
         // Move the ball to the mouse, staying on the surface
-        let lo = p.minX + b.r, hi = p.minX + p.width - b.r
+        let lo = p.baseX + b.r, hi = p.baseX + p.width - b.r
         let newX = lo < hi ? min(max(m.x, lo), hi) : b.x
         let moved = newX - b.x
         guard abs(moved) > 0.01 else { return }
@@ -747,7 +1138,7 @@ final class SnowScene: SKScene {
             let from = min(b.x, newX) - b.r * 0.8
             let to = max(b.x, newX) + b.r * 0.8
             let frac = min(0.6, 0.6 * abs(moved) / (1.6 * b.r))
-            if let c0 = p.col(at: max(from, p.minX)), let c1 = p.col(at: min(to, p.minX + p.width - 0.1)), c0 <= c1 {
+            if let c0 = p.col(at: max(from, p.baseX)), let c1 = p.col(at: min(to, p.baseX + p.width - 0.1)), c0 <= c1 {
                 for c in c0...c1 where !p.occ[c] {
                     let take = p.h[c] * frac
                     p.h[c] -= take
@@ -775,7 +1166,7 @@ final class SnowScene: SKScene {
         for o in ahead {
             let need = pusher.x + dir * (pusher.r + o.r)     // where o must be to just touch the pusher
             guard (need - o.x) * dir > 0 else { break }       // not touching: the chain stops here
-            let lo = p.minX + o.r, hi = p.minX + p.width - o.r
+            let lo = p.baseX + o.r, hi = p.baseX + p.width - o.r
             if need < lo || need > hi {
                 o.x = need
                 o.drop(vel: CGVector(dx: dir * 140, dy: 40))  // pushed off the edge
@@ -826,10 +1217,13 @@ final class SnowScene: SKScene {
             } else if let p = b.pile {
                 if let c = p.col(at: b.x) {
                     b.node.isHidden = p.occ[c]     // hidden behind a window in front
+                    b.y = p.surface(c) + b.r - 1.5  // sits slightly sunk into the snow
                 } else {
-                    b.node.isHidden = true
+                    // The window shrank (or moved) out from under it: let it fall off the nearest end
+                    // onto whatever is below, instead of leaving it hidden in mid-air.
+                    let dir: CGFloat = b.x < p.baseX ? -1 : 1
+                    b.drop(vel: CGVector(dx: dir * 120, dy: 20))
                 }
-                b.y = p.topY + b.r - 1.5           // sits slightly sunk into the snow
             } else {
                 b.drop(vel: .zero)                 // lost its support (e.g. the ball below was removed)
             }
@@ -887,9 +1281,9 @@ final class SnowScene: SKScene {
         b.falling = false
         b.vel = .zero
         b.pile = p
-        let lo = p.minX + b.r, hi = p.minX + p.width - b.r
+        let lo = p.baseX + b.r, hi = p.baseX + p.width - b.r
         if lo < hi { b.x = min(max(b.x, lo), hi) }
-        b.y = p.topY + b.r - 1.5
+        if let c = p.col(at: b.x) { b.y = p.surface(c) + b.r - 1.5 }
     }
 
     /// A falling snowball bursts into loose snow when it hits the ground
@@ -931,21 +1325,11 @@ final class SnowScene: SKScene {
 
         for item in newOrder {
             let id = item.id, r = item.rect
-            if let pile = piles[id], let old = lastRect[id] {
-                if abs(old.width - r.width) > 0.5 {
-                    // Width changed: drop the snow and start a new pile
-                    release(pile, vel: .zero, id: id)
-                    pile.remove()
-                    piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, parent: world)
-                } else if abs(old.minX - r.minX) > 0.3 || abs(old.maxY - r.maxY) > 0.3 {
-                    // Window dragged: fling the snow off
-                    let v = CGVector(dx: (r.minX - old.minX) / dt, dy: (r.maxY - old.maxY) / dt)
-                    pile.minX = r.minX
-                    pile.topY = r.maxY
-                    release(pile, vel: v, id: id)
-                }
+            if let pile = piles[id] {
+                pile.moveWindow(left: r.minX, right: r.maxX, top: r.maxY, dt: dt, now: t)
             } else {
-                piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, parent: world)
+                piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width,
+                                 maxH: Cfg.windowPileMax, parent: world, isWindow: true)
             }
             lastRect[id] = r
         }
@@ -959,9 +1343,53 @@ final class SnowScene: SKScene {
         }
 
         computeOcclusion()
-        for p in piles.values { p.redraw() }
+        let joltScale = min(max(1440 / max(size.height, 1), 0.5), 2.0) * 2.0
+        for (id, p) in piles {
+            p.carry(dt: dt, joltScale: joltScale)
+            p.redraw()
+            drainLedge(p, id: id)
+        }
         dockPile?.redraw()
         ground?.redraw()
+    }
+
+    /// Turns what slid off a window ledge (or all of it, when the window jumped or lifted away) into falling snow.
+    func drainLedge(_ p: Pile, id: Int) {
+        // Snow that slumped past an end of the window falls from that edge.
+        if p.spillL > 1.5 {
+            let pieces = max(1, Int((p.spillL / 10).rounded(.up)))
+            for _ in 0..<pieces {
+                spawnClump(at: CGPoint(x: p.baseX + rnd(0, 2), y: p.surface(0)),
+                           vel: CGVector(dx: p.trackVel.dx - 6 + rnd(-30, 30), dy: p.trackVel.dy - 15 + rnd(10, 60)),
+                           sourceID: id)
+            }
+            p.spillL = 0
+        }
+        if p.spillR > 1.5 {
+            let pieces = max(1, Int((p.spillR / 10).rounded(.up)))
+            for _ in 0..<pieces {
+                spawnClump(at: CGPoint(x: p.baseX + p.width - rnd(0, 2), y: p.surface(p.count - 1)),
+                           vel: CGVector(dx: p.trackVel.dx + 6 + rnd(-30, 30), dy: p.trackVel.dy - 15 + rnd(10, 60)),
+                           sourceID: id)
+            }
+            p.spillR = 0
+        }
+        guard !p.pending.isEmpty else { return }
+        for event in p.pending {
+            if event.height < 0 {
+                release(p, vel: event.vel, id: id)          // the whole heap lets go
+            } else {
+                let pieces = max(1, Int((event.height / 3.5).rounded()))
+                for _ in 0..<pieces {
+                    spawnClump(at: CGPoint(x: event.at.x + rnd(-1.5, 1.5),
+                                           y: event.at.y + rnd(0, max(0.1, event.height))),
+                               vel: CGVector(dx: event.vel.dx * 0.5 + rnd(-40, 40),
+                                             dy: event.vel.dy * 0.4 + rnd(10, 80)),
+                               sourceID: id)
+                }
+            }
+        }
+        p.pending.removeAll()
     }
 
     func updateDock() {
@@ -1015,7 +1443,7 @@ final class SnowScene: SKScene {
         for (i, item) in order.enumerated() {
             guard let p = piles[item.id] else { continue }
             for c in 0..<p.count {
-                let pt = CGPoint(x: p.colX(c), y: p.topY + 1)
+                let pt = CGPoint(x: p.colX(c), y: p.baseY + (p.isWindow ? p.bed[c] : 0) + 1)
                 var o = pt.x < 0 || pt.x > size.width || pt.y > size.height
                 if !o {
                     for j in 0..<i where order[j].rect.contains(pt) { o = true; break }
@@ -1041,9 +1469,41 @@ final class SnowScene: SKScene {
         }
     }
 
+    // MARK: Cursor wake
+
+    /// The cursor drags a little air with it. Remember where it is and how fast it goes, so the falling flakes
+    /// it sweeps through can be stirred by its wake (ported from Snowhush's track_cursor / cursor_wake).
+    func trackCursor(_ dt: CGFloat) {
+        let m = NSEvent.mouseLocation
+        guard cursorSeen else {
+            cursorSeen = true
+            cursorPos = m
+            return
+        }
+        let delta = CGVector(dx: m.x - cursorPos.x, dy: m.y - cursorPos.y)
+        cursorPos = m
+        guard dt > 0 else { return }
+        var v = CGVector(dx: delta.dx / dt, dy: delta.dy / dt)
+        let speed = (v.dx * v.dx + v.dy * v.dy).squareRoot()
+        if speed > 3000 {                    // a jump across the screen isn't a hand movement
+            v.dx *= 3000 / speed
+            v.dy *= 3000 / speed
+        }
+        // Smooth it, so one twitchy frame doesn't send the snow flying
+        cursorVel = CGVector(dx: cursorVel.dx + (v.dx - cursorVel.dx) * 0.5,
+                             dy: cursorVel.dy + (v.dy - cursorVel.dy) * 0.5)
+    }
+
     func stepFlakes(_ dt: CGFloat) {
         // A few sines at different frequencies add up to gusty wind
         let wind = 14 * sin(t * 0.11) + 9 * sin(t * 0.37 + 1.3) + 6 * sin(t * 0.9 + 0.4)
+        // The air a moving cursor drags along, which carries off the flakes it sweeps through
+        var wake: CGVector?
+        let wakeSpeed = (cursorVel.dx * cursorVel.dx + cursorVel.dy * cursorVel.dy).squareRoot()
+        if wakeSpeed > Cfg.cursorWakeMinSpeed {
+            let s = min(1, Cfg.cursorWakeMaxSpeed / wakeSpeed)
+            wake = CGVector(dx: cursorVel.dx * s, dy: cursorVel.dy * s)
+        }
         var normal = 0
         var i = flakes.count - 1
         while i >= 0 {
@@ -1051,17 +1511,34 @@ final class SnowScene: SKScene {
             var p = f.node.position
             let prevY = p.y
 
+            // Stir flakes near the cursor toward its wake: the nearer the flake, the stronger the pull.
+            if let w = wake {
+                let dx = p.x - cursorPos.x, dy = p.y - cursorPos.y
+                let d2 = dx * dx + dy * dy
+                let r = Cfg.cursorWakeRadius
+                if d2 < r * r {
+                    let falloff = 1 - d2.squareRoot() / r
+                    let k = min(1, falloff * falloff * 4 * dt)
+                    f.push.dx += (w.dx - f.push.dx) * k
+                    f.push.dy += (w.dy - f.push.dy) * k
+                }
+            }
+
             if f.isClump {
                 f.vel.dy -= Cfg.gravity * dt
                 f.vel.dx *= max(0, 1 - 1.2 * dt)
-                p.x += f.vel.dx * dt
-                p.y += f.vel.dy * dt
+                p.x += (f.vel.dx + f.push.dx) * dt
+                p.y += (f.vel.dy + f.push.dy) * dt
             } else {
                 let sway = sin(t * f.swayFreq + f.phase) * f.swayAmp
-                p.x += (wind * f.windFactor + sway) * dt
-                p.y += f.vel.dy * dt
+                p.x += (wind * f.windFactor + sway + f.push.dx) * dt
+                p.y += (f.vel.dy + f.push.dy) * dt
                 if p.x < -40 { p.x += size.width + 80 } else if p.x > size.width + 40 { p.x -= size.width + 80 }
             }
+            // The air calms again once the cursor is gone
+            let drag = max(0, 1 - 2.4 * dt)
+            f.push.dx *= drag
+            f.push.dy *= drag
 
             var gone = false
             if p.y < prevY {
@@ -1075,13 +1552,13 @@ final class SnowScene: SKScene {
                     }
                 }
                 // Then check window tops, front to back
-                if !gone && !f.inFront { for item in order {
+                if !gone && (Cfg.snowOverWindows || !f.inFront) { for item in order {
                     guard let pile = piles[item.id] else { continue }
                     if f.isClump && item.id == f.ignoreID && t < f.ignoreUntil { continue }
                     guard let c = pile.col(at: p.x), !pile.occ[c] else { continue }
                     let s = pile.surface(c)
                     if prevY >= s && p.y < s {
-                        pile.add(at: c, amount: f.isClump ? 1.6 : f.size * 0.16)
+                        pile.add(at: c, amount: f.isClump ? 2.4 : f.size * 0.40)
                         gone = true
                         break
                     }
@@ -1093,8 +1570,9 @@ final class SnowScene: SKScene {
                 }
             }
             if !gone {
-                // Flakes that fall "behind" a window disappear
-                if !f.inFront {
+                // Snow falls in front of open windows (like Snowhush), so you can watch it land on their top
+                // edges. With snowOverWindows off, flakes that fall "behind" a window disappear instead.
+                if !Cfg.snowOverWindows && !f.inFront {
                     for item in order where item.rect.contains(p) { gone = true; break }
                 }
                 if p.y < -20 { gone = true }
