@@ -28,6 +28,8 @@ enum Cfg {
     static let ballMaxRadius: CGFloat = 28   // and stops growing at this size
     static let maxBalls = 20                 // oldest resting snowballs are removed beyond this
     static let dockGain: CGFloat = 3.0       // snow landing on the Dock counts this many times more, so it builds up
+    static var snowOverWindows = false       // false: snow stays on the desktop, behind your windows and off full-screen apps
+                                             // true: snow is drawn on top of every window (toggle in the ❄︎ menu)
 }
 
 // MARK: - Find the Dock (needs Accessibility permission)
@@ -417,7 +419,7 @@ final class SnowScene: SKScene {
         let r = CGFloat.random(in: 0...1)
         let li = r < 0.40 ? 0 : (r < 0.68 ? 1 : 2)   // 40% far, 28% middle, 32% near
         let L = layers[li]
-        f.inFront = Cfg.flakesInFront && li == 0 && CGFloat.random(in: 0...1) < Cfg.inFrontFraction
+        f.inFront = Cfg.flakesInFront && Cfg.snowOverWindows && li == 0 && CGFloat.random(in: 0...1) < Cfg.inFrontFraction
         f.isClump = false
         f.ignoreID = -1
         f.size = CGFloat.random(in: L.size)
@@ -1146,8 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .clear
         window.hasShadow = false
         window.ignoresMouseEvents = true          // clicks pass straight through
-        window.level = .floating                  // above normal windows, below the Dock and menu bar
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        applyWindowPlacement()
 
         let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
         view.allowsTransparency = true
@@ -1173,6 +1174,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
             ws.addObserver(self, selector: #selector(resumeRendering), name: name, object: nil)
         }
+    }
+
+    /// Desktop mode: sit just above the wallpaper (below desktop icons and every app window), and stay out of
+    /// full-screen apps. Over-windows mode: float above normal windows and join full-screen spaces too.
+    func applyWindowPlacement() {
+        if Cfg.snowOverWindows {
+            window.level = .floating              // above normal windows, below the Dock and menu bar
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        } else {
+            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        }
+    }
+
+    @objc func toggleOverWindows(_ sender: NSMenuItem) {
+        Cfg.snowOverWindows.toggle()
+        sender.state = Cfg.snowOverWindows ? .on : .off
+        applyWindowPlacement()
+        if !scene.isPaused { window.orderFrontRegardless() }
     }
 
     @objc func suspendRendering() {
@@ -1206,6 +1226,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         amount.submenu = sub
         menu.addItem(amount)
+
+        let over = NSMenuItem(title: "Snow Over Windows", action: #selector(toggleOverWindows(_:)), keyEquivalent: "")
+        over.target = self
+        over.state = Cfg.snowOverWindows ? .on : .off
+        menu.addItem(over)
 
         let clear = NSMenuItem(title: "Clear Snow", action: #selector(clearSnow), keyEquivalent: "c")
         clear.target = self

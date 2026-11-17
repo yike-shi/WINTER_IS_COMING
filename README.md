@@ -25,7 +25,7 @@ cd WINTER_IS_COMING
 zsh build.sh
 ```
 
-Use the ❄︎ in the menu bar to pause, pick light, medium or heavy snow, clear the snow, or quit.
+Use the ❄︎ in the menu bar to pause, pick light, medium or heavy snow, clear the snow, or quit. Snow stays on your desktop, behind your windows, by default. Turn on **Snow Over Windows** in the menu to have it fall on top of everything, full-screen apps included.
 
 - No `swiftc`? Run `xcode-select --install` first.
 - Want snow on the Dock too? Turn on **Terminal** in System Settings → Privacy & Security → Accessibility.
