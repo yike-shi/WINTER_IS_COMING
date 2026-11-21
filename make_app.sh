@@ -12,10 +12,30 @@ echo "❄︎ Building WinterIsComing ${VERSION}…"
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist/tmp
 
-# 1. Universal binary: runs on both Apple silicon and Intel Macs
-swiftc -O -target arm64-apple-macos12  WinterIsComing.swift -o dist/tmp/WinterIsComing-arm64
-swiftc -O -target x86_64-apple-macos12 WinterIsComing.swift -o dist/tmp/WinterIsComing-x86_64
-lipo -create dist/tmp/WinterIsComing-arm64 dist/tmp/WinterIsComing-x86_64 -output "$APP/Contents/MacOS/WinterIsComing"
+# 1. Binary: universal (arm64 + x86_64) if both targets succeed, otherwise native host architecture
+HAVE_ARM64=0
+if swiftc -O -target arm64-apple-macos12 WinterIsComing.swift -o dist/tmp/WinterIsComing-arm64 2>/dev/null; then
+  HAVE_ARM64=1
+fi
+
+HAVE_X86_64=0
+if swiftc -O -target x86_64-apple-macos12 WinterIsComing.swift -o dist/tmp/WinterIsComing-x86_64 2>/dev/null; then
+  HAVE_X86_64=1
+fi
+
+if [[ $HAVE_ARM64 -eq 1 && $HAVE_X86_64 -eq 1 ]]; then
+  echo "❄︎ Packaging universal binary (arm64 + x86_64)…"
+  lipo -create dist/tmp/WinterIsComing-arm64 dist/tmp/WinterIsComing-x86_64 -output "$APP/Contents/MacOS/WinterIsComing"
+elif [[ $HAVE_ARM64 -eq 1 ]]; then
+  echo "❄︎ Note: x86_64 target not supported by local toolchain; bundling arm64 binary."
+  cp dist/tmp/WinterIsComing-arm64 "$APP/Contents/MacOS/WinterIsComing"
+elif [[ $HAVE_X86_64 -eq 1 ]]; then
+  echo "❄︎ Note: arm64 target not supported by local toolchain; bundling x86_64 binary."
+  cp dist/tmp/WinterIsComing-x86_64 "$APP/Contents/MacOS/WinterIsComing"
+else
+  echo "❄︎ Compiling native host binary…"
+  swiftc -O WinterIsComing.swift -o "$APP/Contents/MacOS/WinterIsComing"
+fi
 
 # 2. App icon (from assets/icon.png)
 ICONSET=dist/tmp/AppIcon.iconset
