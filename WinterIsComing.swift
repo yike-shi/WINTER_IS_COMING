@@ -1329,9 +1329,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
 
         let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        view.autoresizingMask = [.width, .height]
         view.allowsTransparency = true
         view.preferredFramesPerSecond = 60
         view.ignoresSiblingOrder = true
+        let savedFlakes = UserDefaults.standard.integer(forKey: "snowAmount")
+        if savedFlakes > 0 { Cfg.targetFlakes = savedFlakes }
+
         scene = SnowScene(size: screen.frame.size)
         scene.scaleMode = .resizeFill
         view.presentScene(scene)
@@ -1422,6 +1426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func setAmount(_ sender: NSMenuItem) {
         Cfg.targetFlakes = sender.tag
+        UserDefaults.standard.set(sender.tag, forKey: "snowAmount")
         for it in amountItems { it.state = (it === sender) ? .on : .off }
     }
 
@@ -1456,6 +1461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func screensChanged() {
         guard let screen = NSScreen.screens.first else { return }
         window.setFrame(screen.frame, display: true)
+        scene.size = screen.frame.size
     }
 }
 
