@@ -7,6 +7,7 @@
 
 import Cocoa
 import SpriteKit
+import ServiceManagement
 
 // MARK: - Settings (feel free to tweak)
 
@@ -1396,6 +1397,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lightsItem.state = scene.lightsOn ? .on : .off
         menu.addItem(lightsItem)
 
+        // Launch at login (available when packaged as an app)
+        if #available(macOS 13.0, *), Bundle.main.bundleIdentifier != nil {
+            let launch = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+            launch.target = self
+            launch.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+            menu.addItem(launch)
+        }
+
         let clear = NSMenuItem(title: "Clear Snow", action: #selector(clearSnow), keyEquivalent: "c")
         clear.target = self
         menu.addItem(clear)
@@ -1451,6 +1460,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleLights() {
         scene.setLights(!scene.lightsOn)
         lightsItem.state = scene.lightsOn ? .on : .off
+    }
+
+    @available(macOS 13.0, *)
+    @objc func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+                sender.state = .off
+            } else {
+                try SMAppService.mainApp.register()
+                sender.state = .on
+            }
+        } catch {
+            print("❄︎ Launch at login update failed: \(error)")
+        }
     }
 
     @objc func screensChanged() {
