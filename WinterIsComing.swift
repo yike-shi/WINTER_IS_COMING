@@ -494,6 +494,10 @@ final class SnowScene: SKScene {
     var dragVel = CGVector.zero
     var speckTex: SKTexture?
     static let dockID = -2
+    var origin = CGPoint.zero      // this screen's bottom-left in global Cocoa coords
+    var primaryH: CGFloat = 0      // height of the primary screen (for flipping CG coords)
+    weak var screen: NSScreen?
+    func mouse() -> CGPoint { let m = NSEvent.mouseLocation; return CGPoint(x: m.x - origin.x, y: m.y - origin.y) }
 
     override func didMove(to view: SKView) {
         backgroundColor = .clear
@@ -672,7 +676,7 @@ final class SnowScene: SKScene {
     /// does it catch clicks, so you can grab the ball without clicking the window underneath.
     func updateMouseCapture() {
         guard let w = view?.window else { return }
-        let capture = dragBall != nil || ballAt(NSEvent.mouseLocation) != nil
+        let capture = dragBall != nil || ballAt(mouse()) != nil
         if w.ignoresMouseEvents == capture { w.ignoresMouseEvents = !capture }
     }
 
@@ -753,7 +757,7 @@ final class SnowScene: SKScene {
         b.specks.zRotation -= (target.x - b.x) / b.r
         b.x = target.x
         b.y = target.y
-        lastMouse = NSEvent.mouseLocation
+        lastMouse = mouse()
     }
 
     /// A ball dropped just above another ball (that isn't already a full snowman) gets stacked on it
@@ -877,7 +881,7 @@ final class SnowScene: SKScene {
     }
 
     func updateRolling() {
-        let m = NSEvent.mouseLocation     // same coordinates as the scene (origin bottom-left of main screen)
+        let m = mouse()
         let dx = m.x - lastMouse.x
         lastMouse = m
         guard let p = surfaceUnderMouse(m) else { activeBall = nil; return }
@@ -1081,7 +1085,7 @@ final class SnowScene: SKScene {
 
     // Read all window frames (macOS origin is top-left, SpriteKit is bottom-left, so flip y)
     func pollWindows(dt: CGFloat) {
-        let H = size.height
+        let bounds = CGRect(origin: .zero, size: size)
         var newOrder: [(id: Int, rect: CGRect)] = []
         if let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
             for w in info {
@@ -1092,8 +1096,9 @@ final class SnowScene: SKScene {
                       let b = CGRect(dictionaryRepresentation: bd as CFDictionary) else { continue }
                 let alpha = (w[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
                 if alpha < 0.05 || b.width < 80 || b.height < 40 { continue }
-                newOrder.append((id: numN.intValue,
-                                 rect: CGRect(x: b.minX, y: H - b.maxY, width: b.width, height: b.height)))
+                let lr = CGRect(x: b.minX - origin.x, y: primaryH - b.maxY - origin.y, width: b.width, height: b.height)
+                if !lr.intersects(bounds) { continue }   // window is on another screen
+                newOrder.append((id: numN.intValue, rect: lr))
             }
         }
 
@@ -1146,11 +1151,11 @@ final class SnowScene: SKScene {
         var r: CGRect? = nil
         var status: String
         if let f = dockTracker.frame() {
-            var s = CGRect(x: f.minX - Cfg.dockPad, y: size.height - f.maxY,
+            var s = CGRect(x: f.minX - Cfg.dockPad - origin.x, y: primaryH - f.maxY - origin.y,
                            width: f.width + 2 * Cfg.dockPad, height: f.height)
             // The AX frame can reach a bit above the visible Dock shelf. When the Dock is always
             // shown, the space macOS reserves for it (bottom of visibleFrame) is a better top edge.
-            if let screen = NSScreen.screens.first {
+            if let screen = screen {
                 let reserved = screen.visibleFrame.minY - screen.frame.minY
                 if reserved > 10 && reserved < s.maxY { s.size.height = reserved - s.minY }
             }
@@ -1307,44 +1312,18 @@ final class OverlayWindow: NSPanel {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: OverlayWindow!
-    var scene: SnowScene!
+    var paused = false
     var statusItem: NSStatusItem!
     var pauseItem: NSMenuItem!
     var lightsItem: NSMenuItem!
     var amountItems: [NSMenuItem] = []
 
+    var windows: [OverlayWindow] = []
+    var scenes: [SnowScene] = []
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let screen = NSScreen.screens.first else { return }
-        // A non-activating panel can take a click (to grab a snowball) without stealing focus from your apps
-        window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
-                               backing: .buffered, defer: false)
-        window.hidesOnDeactivate = false
-        window.becomesKeyOnlyIfNeeded = true
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true          // clicks pass straight through
-        window.level = .floating                  // above normal windows, below the Dock and menu bar
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-
-        let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        view.allowsTransparency = true
-        view.preferredFramesPerSecond = 60
-        view.ignoresSiblingOrder = true
-        scene = SnowScene(size: screen.frame.size)
-        scene.scaleMode = .resizeFill
-        view.presentScene(scene)
-        window.contentView = view
-        window.setFrame(screen.frame, display: true)
-        window.orderFrontRegardless()
-
+        buildWindows()
         setupMenu()
-        // Show the how-to-play tips once, the very first time the app opens
-        if !UserDefaults.standard.bool(forKey: "seenGuide") {
-            UserDefaults.standard.set(true, forKey: "seenGuide")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.showGuide() }
-        }
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
@@ -1357,16 +1336,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
             ws.addObserver(self, selector: #selector(resumeRendering), name: name, object: nil)
         }
+        // Show the how-to-play tips once, the very first time the app opens
+        if !UserDefaults.standard.bool(forKey: "seenGuide") {
+            UserDefaults.standard.set(true, forKey: "seenGuide")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.showGuide() }
+        }
+    }
+
+    /// One overlay window + scene per screen (snow state resets when screens change)
+    func buildWindows() {
+        for w in windows { w.orderOut(nil) }
+        windows.removeAll(); scenes.removeAll()
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        for screen in NSScreen.screens {
+            // A non-activating panel can take a click (to grab a snowball) without stealing focus from your apps
+            let window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                       backing: .buffered, defer: false)
+            window.hidesOnDeactivate = false
+            window.becomesKeyOnlyIfNeeded = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = false
+            window.ignoresMouseEvents = true          // clicks pass straight through
+            window.level = .floating                  // above normal windows, below the Dock and menu bar
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+
+            let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
+            view.allowsTransparency = true
+            view.preferredFramesPerSecond = 60
+            view.ignoresSiblingOrder = true
+            let scene = SnowScene(size: screen.frame.size)
+            scene.scaleMode = .resizeFill
+            scene.origin = screen.frame.origin
+            scene.primaryH = primaryH
+            scene.screen = screen
+            scene.isPaused = paused
+            view.presentScene(scene)
+            window.contentView = view
+            window.setFrame(screen.frame, display: true)
+            if !paused { window.orderFrontRegardless() }
+            windows.append(window); scenes.append(scene)
+        }
     }
 
     @objc func suspendRendering() {
-        (window.contentView as? SKView)?.isPaused = true
+        for w in windows { (w.contentView as? SKView)?.isPaused = true }
     }
 
     @objc func resumeRendering() {
         // Stay paused if the user paused snow from the menu
-        guard !scene.isPaused else { return }
-        (window.contentView as? SKView)?.isPaused = false
+        guard !paused else { return }
+        for w in windows { (w.contentView as? SKView)?.isPaused = false }
     }
 
     func setupMenu() {
@@ -1393,7 +1413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         lightsItem = NSMenuItem(title: "Fairy Lights ✨", action: #selector(toggleLights), keyEquivalent: "l")
         lightsItem.target = self
-        lightsItem.state = scene.lightsOn ? .on : .off
+        lightsItem.state = UserDefaults.standard.bool(forKey: "fairyLights") ? .on : .off
         menu.addItem(lightsItem)
 
         let clear = NSMenuItem(title: "Clear Snow", action: #selector(clearSnow), keyEquivalent: "c")
@@ -1410,12 +1430,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePause() {
-        scene.isPaused.toggle()
-        if scene.isPaused {
-            window.orderOut(nil)
+        paused.toggle()
+        for s in scenes { s.isPaused = paused }
+        if paused {
+            for w in windows { w.orderOut(nil) }
             pauseItem.title = "Resume Snow"
         } else {
-            window.orderFrontRegardless()
+            for w in windows { w.orderFrontRegardless() }
             pauseItem.title = "Pause Snow"
         }
     }
@@ -1425,7 +1446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for it in amountItems { it.state = (it === sender) ? .on : .off }
     }
 
-    @objc func clearSnow() { scene.clearAll() }
+    @objc func clearSnow() { for s in scenes { s.clearAll() } }
 
     /// A small how-to-play note: the app has no window or Dock icon, so this is where people learn the tricks
     @objc func showGuide() {
@@ -1449,13 +1470,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggleLights() {
-        scene.setLights(!scene.lightsOn)
-        lightsItem.state = scene.lightsOn ? .on : .off
+        let on = lightsItem.state != .on
+        for s in scenes { s.setLights(on) }
+        lightsItem.state = on ? .on : .off
     }
 
     @objc func screensChanged() {
-        guard let screen = NSScreen.screens.first else { return }
-        window.setFrame(screen.frame, display: true)
+        buildWindows()
     }
 }
 
