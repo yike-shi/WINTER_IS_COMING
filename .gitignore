@@ -12,3 +12,7 @@ windows/obj/
 *.new
 .DS_Store
 .vscode/
+
+# Python bytecode / test caches (Linux version)
+__pycache__/
+.pytest_cache/
